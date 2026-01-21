@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# =============================================================================
+# NVIDIA GPU 控制包装脚本 V2.1（2026-01-20）
+# 动态 DISPLAY 检测 + 内部重试机制
+# 只允许通过 sudo（已在 sudoers 中放行）无密码执行本脚本。
+# =============================================================================
+
+# ------------------- 常量 -------------------
+NVSMI="/usr/bin/nvidia-smi"
+NVSETTINGS="/usr/bin/nvidia-settings"
+MIN_POWER=150
+MAX_POWER=600
+MAX_RETRY=3          # nvidia‑settings 失败时的最大重试次数
+CANDIDATE_DISPLAYS=":0 :1 :2 :8 :9 :99 :98"   # 可自行增删
+
+# ------------------- 参数校验 -------------------
+validate_power() {
+    local p=$1
+    if ! [[ "$p" =~ ^[0-9]+$ ]]; then
+        echo "错误: 功率必须是数字" >&2
+        exit 1
+    fi
+    if (( p < MIN_POWER || p > MAX_POWER )); then
+        echo "错误: 功率必须在 ${MIN_POWER}-${MAX_POWER} W 之间" >&2
+        exit 1
+    fi
+}
+validate_gpu_index() {
+    local i=$1
+    if ! [[ "$i" =~ ^[0-9]+$ ]]; then
+        echo "错误: GPU 索引必须是数字" >&2
+        exit 1
+    fi
+}
+validate_fan_index() {
+    local f=$1
+    if ! [[ "$f" =~ ^[0-9]+$ ]]; then
+        echo "错误: Fan 索引必须是数字" >&2
+        exit 1
+    fi
+}
+
+# ------------------- DISPLAY 检测 -------------------
+# 返回第一个能成功执行 nvidia‑settings 的 DISPLAY，若全部失效则返回空字符串
+# 参数: $1 = verbose (1=打印重试日志, 0=静默模式)
+detect_display() {
+    local verbose=${1:-0}
+    
+    # 1.先尝试当前环境变量（如果已经被 systemd 正确注入）
+    if [[ -n "$DISPLAY" ]] && nvidia-settings -q "[gpu:0]/GPUFanControlState" >/dev/null 2>&1; then
+        echo "$DISPLAY"
+        return 0
+    fi
+
+    # 2.逐个尝试候选 DISPLAY
+    for d in $CANDIDATE_DISPLAYS; do
+        [[ "$verbose" == "1" ]] && echo "  尝试 DISPLAY=$d ..." >&2
+        if DISPLAY=$d nvidia-settings -q "[gpu:0]/GPUFanControlState" >/dev/null 2>&1; then
+            [[ "$verbose" == "1" ]] && echo "  ✔ 找到可用 DISPLAY=$d" >&2
+            echo "$d"
+            return 0
+        fi
+    done
+
+    # 3. 全部失效
+    [[ "$verbose" == "1" ]] && echo "  ✖ 所有候选 DISPLAY 均不可用" >&2
+    echo ""
+    return 1
+}
+
+
+
+# ------------------- 带重试的 nvidia‑settings 调用 -------------------
+# 用法： run_nvidia_settings [-v] <nvidia‑settings 参数…>
+# -v: verbose 模式，打印重试过程
+run_nvidia_settings() {
+    local verbose=0
+    if [[ "$1" == "-v" ]]; then
+        verbose=1
+        shift
+    fi
+    
+    local attempt=1
+    local display
+    while (( attempt <= MAX_RETRY )); do
+        [[ "$verbose" == "1" ]] && echo "尝试第 $attempt/$MAX_RETRY 次..." >&2
+        
+        display=$(detect_display "$verbose") || {
+            [[ "$verbose" == "1" ]] && echo "ERROR: 未找到可用 X DISPLAY (尝试 $attempt)" >&2
+            ((attempt++))
+            sleep 1
+            continue
+        }
+        # 通过 sudo -E 把 DISPLAY 传递给 root（或目标）进程
+        # 不重定向 stdout，以便查询命令可以返回结果
+        DISPLAY=$display sudo -E "$NVSETTINGS" "$@" 2>/dev/null && return 0
+
+        [[ "$verbose" == "1" ]] && echo "WARN: nvidia-settings 在 DISPLAY=$display 上失败 (尝试 $attempt)" >&2
+        ((attempt++))
+        sleep 1
+    done
+    echo "ERROR: nvidia-settings 在 $MAX_RETRY 次尝试后失败" >&2
+    return 1
+}
+
+# ------------------- 功率控制（不依赖 X） -------------------
+set_power_limit() {
+    validate_gpu_index "$1"
+    validate_power "$2"
+    $NVSMI -i "$1" -pl "$2"
+}
+get_power_limit() {
+    validate_gpu_index "$1"
+    $NVSMI -i "$1" --query-gpu=power.limit --format=csv,noheader,nounits
+}
+
+# ------------------- 风扇控制（使用动态 DISPLAY）-------------------
+# enable_manual_fan 和 reset_auto_fan 支持 -v 参数以启用详细日志
+enable_manual_fan() {
+    local verbose_flag=""
+    if [[ "$1" == "-v" ]]; then
+        verbose_flag="-v"
+        shift
+    fi
+    validate_gpu_index "$1"
+    run_nvidia_settings $verbose_flag -a "[gpu:$1]/GPUFanControlState=1"
+}
+set_fan_speed() {
+    validate_fan_index "$1"
+    local speed=$2
+    if ! [[ "$speed" =~ ^[0-9]+$ ]] || (( speed < 0 || speed > 100 )); then
+        echo "错误: 风扇转速必须是 0-100 的数字" >&2
+        exit 1
+    fi
+    run_nvidia_settings -a "[fan:$1]/GPUTargetFanSpeed=$speed"
+}
+reset_auto_fan() {
+    local verbose_flag=""
+    if [[ "$1" == "-v" ]]; then
+        verbose_flag="-v"
+        shift
+    fi
+    validate_gpu_index "$1"
+    run_nvidia_settings $verbose_flag -a "[gpu:$1]/GPUFanControlState=0"
+}
+
+# ------------------- 【新增】使用指定 DISPLAY 的风扇控制 -------------------
+# 用于全局检测完 DISPLAY 后，直接使用指定的 DISPLAY 执行命令
+reset_auto_fan_with_display() {
+    local display=$1
+    local gpu_index=$2
+    validate_gpu_index "$gpu_index"
+    if [[ -z "$display" || "$display" == "NONE" ]]; then
+        echo "ERROR: 未指定有效的 DISPLAY" >&2
+        return 1
+    fi
+    # 内部重试机制：最多尝试 2 次，处理 X 服务繁忙的情况
+    local attempt=0
+    while (( attempt < 2 )); do
+        if DISPLAY=$display sudo -E "$NVSETTINGS" -a "[gpu:$gpu_index]/GPUFanControlState=0" >/dev/null 2>&1; then
+            sleep 0.3  # 等待驱动稳定
+            return 0
+        fi
+        ((attempt++))
+        sleep 0.5  # 等待后重试
+    done
+    return 1
+}
+
+enable_manual_fan_with_display() {
+    local display=$1
+    local gpu_index=$2
+    validate_gpu_index "$gpu_index"
+    if [[ -z "$display" || "$display" == "NONE" ]]; then
+        echo "ERROR: 未指定有效的 DISPLAY" >&2
+        return 1
+    fi
+    # 内部重试机制：最多尝试 2 次，处理 X 服务繁忙的情况
+    local attempt=0
+    while (( attempt < 2 )); do
+        if DISPLAY=$display sudo -E "$NVSETTINGS" -a "[gpu:$gpu_index]/GPUFanControlState=1" >/dev/null 2>&1; then
+            sleep 0.3  # 等待驱动稳定
+            return 0
+        fi
+        ((attempt++))
+        sleep 0.5  # 等待后重试
+    done
+    return 1
+}
+
+set_fan_speed_with_display() {
+    local display=$1
+    local fan_index=$2
+    local speed=$3
+    validate_fan_index "$fan_index"
+    if [[ -z "$display" || "$display" == "NONE" ]]; then
+        echo "ERROR: 未指定有效的 DISPLAY" >&2
+        return 1
+    fi
+    if ! [[ "$speed" =~ ^[0-9]+$ ]] || (( speed < 0 || speed > 100 )); then
+        echo "错误: 风扇转速必须是 0-100 的数字" >&2
+        return 1
+    fi
+    # 内部重试机制：最多尝试 2 次，处理 X 服务繁忙的情况
+    local attempt=0
+    while (( attempt < 2 )); do
+        if DISPLAY=$display sudo -E "$NVSETTINGS" -a "[fan:$fan_index]/GPUTargetFanSpeed=$speed" >/dev/null 2>&1; then
+            sleep 0.3  # 等待驱动稳定
+            return 0
+        fi
+        ((attempt++))
+        sleep 0.5  # 等待后重试
+    done
+    return 1
+}
+
+# ------------------- **新增**：风扇转速查询 -------------------
+get_fan_speed() {
+    validate_fan_index "$1"
+    # 读取当前风扇转速（%），若失败返回空字符串
+    local out
+    out=$(run_nvidia_settings -q "[fan:$1]/GPUCurrentFanSpeed" 2>/dev/null) || {
+        echo "N/A"
+        return 1
+    }
+    # 解析输出，只取数字部分
+# local speed=$(echo "$out" | grep -oP '\d+(?=\.)' | head -n1)
+ local speed=$(echo "$out" | awk '/[0-9]+\./ {print int($NF); exit}')
+    if [[ -z "$speed" ]]; then
+        echo "N/A"
+    else
+        echo "$speed"
+    fi
+}
+# ------------------- 显示器查询 -------------------
+get_current_display() {
+    local display=$(detect_display)
+    if [[ -n "$display" ]]; then
+        echo "$display"
+        return 0
+    else
+        echo "NONE"
+        return 1
+    fi
+}
+
+# ------------------- 【新增】带 verbose 的全局 DISPLAY 检测 -------------------
+# 输出检测过程日志到 stderr，输出可用的 DISPLAY 到 stdout
+get_display_verbose() {
+    echo "开始检测可用的 X DISPLAY..." >&2
+    
+    # 1.先尝试当前环境变量
+    if [[ -n "$DISPLAY" ]]; then
+        echo "  检查当前环境 DISPLAY=$DISPLAY ..." >&2
+        if nvidia-settings -q "[gpu:0]/GPUFanControlState" >/dev/null 2>&1; then
+            echo "  ✔ 当前环境 DISPLAY=$DISPLAY 可用" >&2
+            echo "$DISPLAY"
+            return 0
+        fi
+    fi
+
+    # 2.逐个尝试候选 DISPLAY
+    for d in $CANDIDATE_DISPLAYS; do
+        echo "  尝试 DISPLAY=$d ..." >&2
+        if DISPLAY=$d nvidia-settings -q "[gpu:0]/GPUFanControlState" >/dev/null 2>&1; then
+            echo "  ✔ 找到可用 DISPLAY=$d" >&2
+            echo "$d"
+            return 0
+        fi
+    done
+
+    # 3. 全部失效
+    echo "  ✖ 所有候选 DISPLAY 均不可用" >&2
+    echo "NONE"
+    return 1
+}
+
+# ------------------- 参数分发 -------------------
+case "$1" in
+    set_power_limit) set_power_limit "$2" "$3" ;;
+    get_power_limit) get_power_limit "$2" ;;
+    enable_manual)   enable_manual_fan "$2" ;;
+    enable_manual_v) enable_manual_fan -v "$2" ;;  # verbose 模式
+    enable_manual_d) enable_manual_fan_with_display "$2" "$3" ;;  # 指定 DISPLAY
+    set_fan_speed)   set_fan_speed "$2" "$3" ;;
+    set_fan_speed_d) set_fan_speed_with_display "$2" "$3" "$4" ;;  # 指定 DISPLAY
+    reset_auto)      reset_auto_fan "$2" ;;
+    reset_auto_v)    reset_auto_fan -v "$2" ;;      # verbose 模式
+    reset_auto_d)    reset_auto_fan_with_display "$2" "$3" ;;  # 指定 DISPLAY
+    get_fan_speed)   get_fan_speed "$2" ;;
+    get_display)     get_current_display ;;
+    get_display_v)   get_display_verbose ;;         # verbose 模式
+    *)
+        cat <<-EOF
+用法: $0 <command> [args...]
+功率控制:
+  set_power_limit <gpu_index> <watts>
+  get_power_limit <gpu_index>
+风扇控制:
+  enable_manual   <gpu_index>             # 动态检测 DISPLAY
+  enable_manual_d <display> <gpu_index>   # 使用指定 DISPLAY
+  set_fan_speed   <fan_index> <speed>     # 动态检测 DISPLAY
+  set_fan_speed_d <display> <fan_index> <speed>  # 使用指定 DISPLAY
+  reset_auto      <gpu_index>             # 动态检测 DISPLAY
+  reset_auto_d    <display> <gpu_index>   # 使用指定 DISPLAY
+  get_fan_speed   <fan_index>
+显示器查询:
+  get_display                             # 静默模式
+  get_display_v                           # verbose 模式
+EOF
+        exit 1
+        ;;
+esac
+
