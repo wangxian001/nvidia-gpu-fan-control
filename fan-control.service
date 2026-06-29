@@ -1,0 +1,25 @@
+[Unit]
+Description=NVIDIA GPU Auto Fan Control Service
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Environment=DISPLAY=:0
+# Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
+# 【2026-06-30 v3 优化】延迟120秒启动,确保桌面/X server/systemd --user 环境完全就绪
+# 实测开机时 fan-control 启动比 lightdm 自动登录早约 4 秒,
+# 导致 fan_control.sh fork 时环境凝固为空 DISPLAY/XAUTHORITY 状态,
+# 后续无论怎么检测都无法挽回. 用 ExecStartPre 等待是最干净的方案:
+# systemd 等 120 秒后才 fork 主进程, 那时环境完全就绪, 一次成功.
+# 注意: 必须用 ExecStartPre 而不是脚本内 sleep, 因为脚本内 sleep
+# 时进程已经 fork, 环境已凝固, sleep 后也读不到新环境变量.
+ExecStartPre=/bin/sleep 120
+ExecStart=/home/fan_control/fan_control.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=180
+StandardOutput=file:/home/fan_control/fan_control.log
+StandardError=file:/home/fan_control/fan_control.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=X Display Environment Diagnostic (read-only, 5 min)
+After=multi-user.target
+Before=graphical.target
+DefaultDependencies=no
+
+[Service]
+Type=simple
+ExecStart=/home/fan_control/xdiag/xdiag.sh
+StandardOutput=null
+StandardError=null
+# 跑完即退, 不重启
+Restart=no
+# 限时 6 分钟, 防卡死
+TimeoutStartSec=400
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

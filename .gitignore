@@ -1,0 +1,8 @@
+# 日志文件
+*.log
+/log/
+
+# 系统临时文件
+*.bak*
+.DS_Store
+Thumbs.db
