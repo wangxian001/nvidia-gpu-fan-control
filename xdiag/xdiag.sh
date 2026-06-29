@@ -1,12 +1,29 @@
 #!/bin/bash
 # =============================================================================
 # X Display 环境演化诊断脚本（只读，不修改任何系统文件）
-# 版本: 2026-06-29 v1
+# 版本: 2026-06-30 v2 (脱敏通用版)
 # 用途: 从系统启动早期开始，每秒采样一次 X 环境关键状态，持续 5 分钟
 #       用于定位 fan-control.service 开机自启失败时的 X 认证机制
+# 使用: 部署到目标服务器后直接运行, 或通过 xdiag.service 开机自启
 # =============================================================================
 
 LOG_FILE="/home/fan_control/xdiag.log"
+
+# 自动检测当前桌面用户（通过 loginctl 或 who 命令）
+REAL_USER=""
+# 优先从 loginctl 获取登录的用户
+REAL_USER=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $2; exit}')
+if [[ -z "$REAL_USER" ]]; then
+    # 回退: 从 who 获取
+    REAL_USER=$(who -u 2>/dev/null | head -1 | awk '{print $1}')
+fi
+if [[ -z "$REAL_USER" ]]; then
+    # 再回退: 取第一个有 home 目录的非 root 用户
+    REAL_USER=$(ls /home/ 2>/dev/null | head -1)
+fi
+REAL_USER="${REAL_USER:-unknown}"
+REAL_HOME="/home/${REAL_USER}"
+
 SAMPLES_TOTAL=300       # 总采样次数（5 分钟）
 INTERVAL_SEC=1          # 采样间隔（秒）
 BOOT_EPOCH=$(date +%s)  # 脚本启动时间戳
@@ -15,7 +32,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 
 # ---------------------- 日志辅助函数 ----------------------
 hline()  { echo "================================================================================" >> "$LOG_FILE"; }
-hdr()    { hline; echo "[$1]  开机后第 $2 秒  采样 #$3 / $SAMPLES_TOTAL" >> "$LOG_FILE"; hline; }
+hdr()    { hline; echo "[$1]  开机后第 $2 秒  采样 #$3 / $SAMPLES_TOTAL  桌面用户: ${REAL_USER}" >> "$LOG_FILE"; hline; }
 sect()   { echo "" >> "$LOG_FILE"; echo "--- $1 ---" >> "$LOG_FILE"; }
 log()    { echo "$1" >> "$LOG_FILE"; }
 
@@ -64,18 +81,21 @@ check_x_server() {
     [[ -n "$locks" ]] && log "  其他 X lock: $locks"
 }
 
-# 检查 xhost SI 列表（必须用 wangxian 身份且 DISPLAY 设好）
+# 检查 xhost SI 列表（必须用 ${REAL_USER} 身份且 DISPLAY 设好）
 check_xhost() {
     local out
-    out=$(sudo -u wangxian -H DISPLAY=:0 xhost 2>&1)
+    out=$(sudo -u "${REAL_USER}" -H DISPLAY=:0 xhost 2>&1)
     log "xhost @DISPLAY=:0 输出:"
     echo "$out" | sed 's/^/  /' >> "$LOG_FILE"
 }
 
-# 检查 systemd --user 环境（必须用 wangxian 身份）
+# 检查 systemd --user 环境（必须用 ${REAL_USER} 身份）
 check_systemd_user_env() {
+    local uid
+    uid=$(id -u "${REAL_USER}" 2>/dev/null)
+    uid="${uid:-1000}"
     local out
-    out=$(sudo -u wangxian -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user show-environment 2>/dev/null | grep -E "^DISPLAY=|^XAUTHORITY=|^WAYLAND")
+    out=$(sudo -u "${REAL_USER}" -H XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user show-environment 2>/dev/null | grep -E "^DISPLAY=|^XAUTHORITY=|^WAYLAND")
     if [[ -n "$out" ]]; then
         log "systemd --user 环境:"
         echo "$out" | sed 's/^/  /' >> "$LOG_FILE"
@@ -92,13 +112,13 @@ check_sessions() {
 
 # ---------------------- 关键功能验证测试 ----------------------
 
-# TEST_A: wangxian 身份 + 空环境 + 遍历候选 DISPLAY，查询 GPUFanControlState
-#   目的: 验证 SI:localuser:wangxian 机制是否独立于 .Xauthority 文件
-test_a_wangxian_pure_si() {
-    log "TEST_A: wangxian 身份 + env -i + 遍历 DISPLAY 查询 (考察 SI 机制)"
+# TEST_A: ${REAL_USER} 身份 + 空环境 + 遍历候选 DISPLAY，查询 GPUFanControlState
+#   目的: 验证 SI:localuser 机制是否独立于 .Xauthority 文件
+test_a_user_pure_si() {
+    log "TEST_A: ${REAL_USER} 身份 + env -i + 遍历 DISPLAY 查询 (考察 SI 机制)"
     for d in :0 :1 :2 :8 :9 :99 :98; do
         local out rc
-        out=$(sudo -u wangxian -H env -i DISPLAY=$d /usr/bin/nvidia-settings -q "[gpu:0]/GPUFanControlState" 2>&1 | head -1)
+        out=$(sudo -u "${REAL_USER}" -H env -i DISPLAY=$d /usr/bin/nvidia-settings -q "[gpu:0]/GPUFanControlState" 2>&1 | head -1)
         rc=$?
         log "  DISPLAY=$d: rc=$rc  输出: $out"
         [[ $rc -eq 0 && "$out" == *"Attribute"* ]] && break
@@ -108,9 +128,8 @@ test_a_wangxian_pure_si() {
 # TEST_B: 完全模拟 fan_control.sh 当前调用方式 (sudo helper get_display)
 test_b_current_invocation() {
     log "TEST_B: 当前 fan_control.sh 的调用方式 (sudo helper get_display)"
-    # 模拟开机时进程环境 (空 DISPLAY/XAUTHORITY)
     local out rc
-    out=$(sudo -u wangxian -H env -i sudo /usr/local/bin/nvidia-fan-helper get_display 2>&1)
+    out=$(sudo -u "${REAL_USER}" -H env -i sudo /usr/local/bin/nvidia-fan-helper get_display 2>&1)
     rc=$?
     log "  rc=$rc  输出: $out"
 }
@@ -119,7 +138,7 @@ test_b_current_invocation() {
 test_c_proposed_fix() {
     log "TEST_C: 提议的修复 (无 sudo, helper get_display)"
     local out rc
-    out=$(sudo -u wangxian -H env -i /usr/local/bin/nvidia-fan-helper get_display 2>&1)
+    out=$(sudo -u "${REAL_USER}" -H env -i /usr/local/bin/nvidia-fan-helper get_display 2>&1)
     rc=$?
     log "  rc=$rc  输出: $out"
 }
@@ -130,7 +149,7 @@ test_d_actual_fan_control() {
     log "TEST_D: 模拟开机环境下设置/恢复风扇模式 (将做实际操作并立即恢复)"
     # 先查原始状态
     local orig
-    orig=$(sudo -u wangxian -H env -i /usr/local/bin/nvidia-fan-helper get_display 2>&1)
+    orig=$(sudo -u "${REAL_USER}" -H env -i /usr/local/bin/nvidia-fan-helper get_display 2>&1)
     log "  当前检测 DISPLAY: $orig"
     if [[ "$orig" == "NONE" || -z "$orig" ]]; then
         log "  跳过 (DISPLAY 不可用)"
@@ -139,14 +158,14 @@ test_d_actual_fan_control() {
 
     # 尝试 enable_manual_d
     local out1 rc1
-    out1=$(sudo -u wangxian -H env -i /usr/local/bin/nvidia-fan-helper enable_manual_d "$orig" 0 2>&1)
+    out1=$(sudo -u "${REAL_USER}" -H env -i /usr/local/bin/nvidia-fan-helper enable_manual_d "$orig" 0 2>&1)
     rc1=$?
     log "  enable_manual_d $orig 0: rc=$rc1  输出: $out1"
 
     # 立即恢复
     sleep 0.5
     local out2 rc2
-    out2=$(sudo -u wangxian -H env -i /usr/local/bin/nvidia-fan-helper reset_auto_d "$orig" 0 2>&1)
+    out2=$(sudo -u "${REAL_USER}" -H env -i /usr/local/bin/nvidia-fan-helper reset_auto_d "$orig" 0 2>&1)
     rc2=$?
     log "  reset_auto_d $orig 0 (立即恢复): rc=$rc2  输出: $out2"
 }
@@ -157,6 +176,7 @@ hline
 log "X Display 诊断脚本启动"
 log "启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
 log "脚本 PID: $$"
+log "检测到的桌面用户: ${REAL_USER}  HOME: ${REAL_HOME}"
 log "采样配置: 共 $SAMPLES_TOTAL 次, 间隔 $INTERVAL_SEC 秒"
 hline
 
@@ -172,7 +192,7 @@ for ((i=1; i<=SAMPLES_TOTAL; i++)); do
 
     # ---- 文件层 ----
     sect "Xauthority 文件状态"
-    check_xauth_file "/home/wangxian/.Xauthority" "/home/wangxian/.Xauthority"
+    check_xauth_file "${REAL_HOME}/.Xauthority" "${REAL_HOME}/.Xauthority"
     check_xauth_file "/var/lib/lightdm/.Xauthority" "/var/lib/lightdm/.Xauthority"
     # /var/run/lightdm/root/:0 需要 root 才能读 cookies
     if [[ -e "/var/run/lightdm/root/:0" ]]; then
@@ -205,7 +225,7 @@ for ((i=1; i<=SAMPLES_TOTAL; i++)); do
     # 这一层每 10 秒做一次（避免日志爆炸）
     if (( i == 1 || i % 10 == 0 )); then
         sect "功能验证测试"
-        test_a_wangxian_pure_si
+        test_a_user_pure_si
         log ""
         test_b_current_invocation
         log ""

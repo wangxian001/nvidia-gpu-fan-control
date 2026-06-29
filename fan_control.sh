@@ -22,7 +22,7 @@
 #       届时桌面/PAM/systemd --user 环境注入全部完成, 新进程能继承到
 #       正确的 DISPLAY/XAUTHORITY)
 #   2) 两处 get_display_v 调用去掉 sudo (313行+510行),
-#      helper 以 wangxian 身份运行才能用 SI 机制通过 X server 认证;
+#      helper 以普通用户身份运行才能用 SI 机制通过 X server 认证;
 #      若用 sudo, helper 变成 root 身份, root 不在 SI 列表中, 检测必败。
 # ====================================================
 
@@ -322,8 +322,8 @@ set_power_limit() {
 refresh_cached_display() {
     log "风扇操作失败，重新检测 X DISPLAY..."
     local display_output
-    # 【2026-06-29 v2】去掉 sudo: helper 必须以 wangxian 身份运行,
-    # 才能通过 X server 的 SI:localuser:wangxian 认证机制。
+    # 【2026-06-29 v2】去掉 sudo: helper 必须以普通用户身份运行,
+    # 才能通过 X server 的 SI:localuser 认证机制。
     # 若用 sudo, helper 变成 root 身份, root 不在 SI 列表中, 检测必败。
     display_output=$(/usr/local/bin/nvidia-fan-helper get_display_v 2>&1)
     local new_display=$(echo "$display_output" | tail -n 1)

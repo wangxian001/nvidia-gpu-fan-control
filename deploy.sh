@@ -2,22 +2,20 @@
 # =============================================================================
 # NVIDIA GPU 智能温度管理系统 - 部署脚本
 # 版本: 2026-06-30
-# 用法: ./deploy.sh <服务器IP> [服务器用户名]
-#       默认用户名: wangxian
-# 示例: ./deploy.sh 192.168.2.167 wangxian
+# 用法: ./deploy.sh <服务器IP> <服务器用户名>
+# 示例: ./deploy.sh your-server-ip your-username
 # =============================================================================
 
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-    echo "错误: 请指定服务器 IP 地址"
-    echo "用法: $0 <服务器IP> [用户名]"
-    echo "示例: $0 192.168.2.167 wangxian"
+if [[ $# -lt 2 ]]; then
+    echo "错误: 用法 $0 <服务器IP> <服务器用户名>"
+    echo "示例: $0 your-server-ip your-username"
     exit 1
 fi
 
 SERVER_IP="$1"
-SSH_USER="${2:-wangxian}"
+SSH_USER="$2"
 SSH_DEST="${SSH_USER}@${SERVER_IP}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -53,7 +51,10 @@ echo "  上传完成"
 # ==================== 步骤 3: 安装（含备份） ====================
 echo ""
 echo "[3/5] 安装文件到目标位置（自动备份旧文件）..."
-ssh "${SSH_DEST}" << 'INSTALL_EOF'
+# 将 SSH_USER 注入远程环境, 供 heredoc 内的变量使用
+ssh -t "${SSH_DEST}" "U=${SSH_USER}" bash -s << 'INSTALL_EOF'
+    U="${U:?用户名变量未传递}"
+    USER_HOME="/home/${U}"
     BACKUP_SUFFIX=".bak_$(date +%Y%m%d_%H%M%S)"
 
     # fan_control.sh
@@ -63,7 +64,7 @@ ssh "${SSH_DEST}" << 'INSTALL_EOF'
     fi
     cp /tmp/fan_control.sh /home/fan_control/fan_control.sh
     chmod 755 /home/fan_control/fan_control.sh
-    chown wangxian:wangxian /home/fan_control/fan_control.sh
+    chown "${U}:${U}" /home/fan_control/fan_control.sh
     echo "  安装 fan_control.sh ✓"
 
     # nvidia-fan-helper
@@ -77,14 +78,14 @@ ssh "${SSH_DEST}" << 'INSTALL_EOF'
     echo "  安装 nvidia-fan-helper ✓"
 
     # fan-control.service (user service)
-    if [[ -f /home/wangxian/.config/systemd/user/fan-control.service ]]; then
-        cp /home/wangxian/.config/systemd/user/fan-control.service \
-           "/home/wangxian/.config/systemd/user/fan-control.service${BACKUP_SUFFIX}"
+    if [[ -f "${USER_HOME}/.config/systemd/user/fan-control.service" ]]; then
+        cp "${USER_HOME}/.config/systemd/user/fan-control.service" \
+           "${USER_HOME}/.config/systemd/user/fan-control.service${BACKUP_SUFFIX}"
         echo "  已备份 fan-control.service → fan-control.service${BACKUP_SUFFIX}"
     fi
-    mkdir -p /home/wangxian/.config/systemd/user
-    cp /tmp/fan-control.service /home/wangxian/.config/systemd/user/fan-control.service
-    chown wangxian:wangxian /home/wangxian/.config/systemd/user/fan-control.service
+    mkdir -p "${USER_HOME}/.config/systemd/user"
+    cp /tmp/fan-control.service "${USER_HOME}/.config/systemd/user/fan-control.service"
+    chown "${U}:${U}" "${USER_HOME}/.config/systemd/user/fan-control.service"
     echo "  安装 fan-control.service ✓"
 
     # xdiag 诊断脚本
@@ -94,7 +95,7 @@ ssh "${SSH_DEST}" << 'INSTALL_EOF'
     fi
     cp /tmp/xdiag.sh /home/fan_control/xdiag/xdiag.sh
     chmod 755 /home/fan_control/xdiag/xdiag.sh
-    chown wangxian:wangxian /home/fan_control/xdiag/xdiag.sh
+    chown "${U}:${U}" /home/fan_control/xdiag/xdiag.sh
     echo "  安装 xdiag.sh ✓"
 
     # xdiag.service (system service, 仅作为诊断工具保留)
@@ -102,9 +103,9 @@ ssh "${SSH_DEST}" << 'INSTALL_EOF'
         cp /etc/systemd/system/xdiag.service "/etc/systemd/system/xdiag.service${BACKUP_SUFFIX}"
         echo "  已备份 xdiag.service → xdiag.service${BACKUP_SUFFIX}"
     fi
-    sudo cp /tmp/xdiag.service /etc/systemd/system/xdiag.service
-    sudo chmod 644 /etc/systemd/system/xdiag.service
-    sudo chown root:root /etc/systemd/system/xdiag.service
+    cp /tmp/xdiag.service /etc/systemd/system/xdiag.service
+    chmod 644 /etc/systemd/system/xdiag.service
+    chown root:root /etc/systemd/system/xdiag.service
     echo "  安装 xdiag.service ✓"
 
     # 清理临时文件
@@ -117,22 +118,24 @@ echo "  全部安装完成"
 # ==================== 步骤 4: 注册并启动服务 ====================
 echo ""
 echo "[4/5] 注册并启动 fan-control 服务..."
-ssh "${SSH_DEST}" << 'SERVICE_EOF'
+ssh -t "${SSH_DEST}" "U=${SSH_USER}" bash -s << 'SERVICE_EOF'
+    U="${U:?用户名变量未传递}"
+
     # 重新加载 systemd --user 配置
-    sudo -u wangxian -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user daemon-reload
+    sudo -u "${U}" -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user daemon-reload
 
     # 启用服务（开机自启）
-    sudo -u wangxian -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable fan-control.service
+    sudo -u "${U}" -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user enable fan-control.service
     echo "  已启用 fan-control.service (开机自启)"
 
     # 重启服务
-    sudo -u wangxian -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart fan-control.service
+    sudo -u "${U}" -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart fan-control.service
     echo "  已重启 fan-control.service"
 
     # 检查状态
     echo ""
     echo "  服务状态:"
-    sudo -u wangxian -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status fan-control.service --no-pager | head -15
+    sudo -u "${U}" -H XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status fan-control.service --no-pager | head -15
 SERVICE_EOF
 
 echo ""
@@ -182,5 +185,5 @@ echo "  2. 服务器重启后, 服务会在开机 120 秒后自动启动"
 echo "  3. 若需要修改风扇策略, 编辑 /home/fan_control/fan_control.sh 顶部的配置区"
 echo "  4. 修改配置后执行: systemctl --user restart fan-control.service"
 echo "  5. sudoers 配置(首次需要手动添加):"
-echo "     wangxian ALL=(ALL) NOPASSWD: /usr/local/bin/nvidia-fan-helper"
+echo "     <your-username> ALL=(ALL) NOPASSWD: /usr/local/bin/nvidia-fan-helper"
 echo "=============================================="
